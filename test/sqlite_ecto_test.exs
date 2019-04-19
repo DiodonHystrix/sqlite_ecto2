@@ -121,7 +121,7 @@ defmodule Sqlite.Ecto2.Test do
   end
 
   defp normalize(query, operation \\ :all, counter \\ 0) do
-    {query, _params, _key} = Ecto.Query.Planner.prepare(query, operation, Sqlite.Ecto2, counter)
+    {query, _params, _key} = Ecto.Query.Planner.plan(query, operation, Sqlite.Ecto2, counter)
     {query, _} = Ecto.Query.Planner.normalize(query, operation, Sqlite.Ecto2, counter)
     query
   end
@@ -484,8 +484,8 @@ defmodule Sqlite.Ecto2.Test do
     query =
       "schema"
       |> select([m], {m.id, ^true})
-      |> join(:inner, [], Schema2, fragment("?", ^true))
-      |> join(:inner, [], Schema2, fragment("?", ^false))
+      |> join(:inner, [], Schema2, on: fragment("?", ^true))
+      |> join(:inner, [], Schema2, on: fragment("?", ^false))
       |> where([], fragment("?", ^true))
       |> where([], fragment("?", ^false))
       |> having([], fragment("?", ^true))
@@ -562,7 +562,7 @@ defmodule Sqlite.Ecto2.Test do
     assert_raise ArgumentError, "JOINS are not supported on UPDATE statements by SQLite", fn ->
       query =
         Schema
-        |> join(:inner, [p], q in Schema2, p.x == q.z)
+        |> join(:inner, [p], q in Schema2, on: p.x == q.z)
         |> update([_], set: [x: 0])
         |> normalize(:update_all)
 
@@ -607,6 +607,7 @@ defmodule Sqlite.Ecto2.Test do
   # new don't know what to expect
   test "update all with prefix" do
     query = from(m in Schema, update: [set: [x: 0]]) |> normalize(:update_all)
+
     assert update_all(%{query | prefix: "prefix"}) == ~s{UPDATE "prefix"."schema" SET "x" = 0}
   end
 
@@ -618,7 +619,7 @@ defmodule Sqlite.Ecto2.Test do
     assert delete_all(query) == ~s{DELETE FROM "schema" WHERE ("schema"."x" = 123)}
 
     assert_raise ArgumentError, "JOINS are not supported on DELETE statements by SQLite", fn ->
-      query = Schema |> join(:inner, [p], q in Schema2, p.x == q.z) |> normalize
+      query = Schema |> join(:inner, [p], q in Schema2, on: p.x == q.z) |> normalize
       delete_all(query)
     end
 
@@ -653,15 +654,16 @@ defmodule Sqlite.Ecto2.Test do
   ## Joins
 
   test "join" do
-    query = Schema |> join(:inner, [p], q in Schema2, p.x == q.z) |> select([], true) |> normalize
+    query =
+      Schema |> join(:inner, [p], q in Schema2, on: p.x == q.z) |> select([], true) |> normalize
 
     assert all(query) ==
              ~s{SELECT 1 FROM "schema" AS s0 INNER JOIN "schema2" AS s1 ON s0."x" = s1."z"}
 
     query =
       Schema
-      |> join(:inner, [p], q in Schema2, p.x == q.z)
-      |> join(:inner, [], Schema, true)
+      |> join(:inner, [p], q in Schema2, on: p.x == q.z)
+      |> join(:inner, [], Schema, on: true)
       |> select([], true)
       |> normalize
 
@@ -671,7 +673,8 @@ defmodule Sqlite.Ecto2.Test do
   end
 
   test "join with nothing bound" do
-    query = Schema |> join(:inner, [], q in Schema2, q.z == q.z) |> select([], true) |> normalize
+    query =
+      Schema |> join(:inner, [], q in Schema2, on: q.z == q.z) |> select([], true) |> normalize
 
     assert all(query) ==
              ~s{SELECT 1 FROM "schema" AS s0 INNER JOIN "schema2" AS s1 ON s1."z" = s1."z"}
@@ -679,7 +682,10 @@ defmodule Sqlite.Ecto2.Test do
 
   test "join without schema" do
     query =
-      "posts" |> join(:inner, [p], q in "comments", p.x == q.z) |> select([], true) |> normalize
+      "posts"
+      |> join(:inner, [p], q in "comments", on: p.x == q.z)
+      |> select([], true)
+      |> normalize
 
     assert all(query) ==
              ~s{SELECT 1 FROM "posts" AS p0 INNER JOIN "comments" AS c1 ON p0."x" = c1."z"}
@@ -690,7 +696,7 @@ defmodule Sqlite.Ecto2.Test do
 
     query =
       "comments"
-      |> join(:inner, [c], p in subquery(posts), true)
+      |> join(:inner, [c], p in subquery(posts), on: true)
       |> select([_, p], p.x)
       |> normalize
 
@@ -702,7 +708,7 @@ defmodule Sqlite.Ecto2.Test do
 
     query =
       "comments"
-      |> join(:inner, [c], p in subquery(posts), true)
+      |> join(:inner, [c], p in subquery(posts), on: true)
       |> select([_, p], p)
       |> normalize
 
@@ -712,10 +718,26 @@ defmodule Sqlite.Ecto2.Test do
   end
 
   test "join with prefix" do
-    query = Schema |> join(:inner, [p], q in Schema2, p.x == q.z) |> select([], true) |> normalize
+    query =
+      Schema
+      |> join(:inner, [p], q in Schema2, on: p.x == q.z)
+      |> select([], true)
+      |> Map.put(:prefix, "prefix")
+      |> normalize
 
-    assert all(%{query | prefix: "prefix"}) ==
+    assert all(query) ==
              ~s{SELECT 1 FROM "prefix"."schema" AS s0 INNER JOIN "prefix"."schema2" AS s1 ON s0."x" = s1."z"}
+
+    query =
+      Schema
+      |> from(prefix: "first")
+      |> join(:inner, [p], q in Schema2, on: p.x == q.z, prefix: "second")
+      |> select([], true)
+      |> Map.put(:prefix, "prefix")
+      |> normalize()
+
+    assert all(query) ==
+             ~s{SELECT 1 FROM "first"."schema" AS s0 INNER JOIN "second"."schema2" AS s1 ON s0."x" = s1."z"}
   end
 
   test "join with fragment" do
@@ -739,7 +761,7 @@ defmodule Sqlite.Ecto2.Test do
   test "join with fragment and on defined" do
     query =
       Schema
-      |> join(:inner, [p], q in fragment("SELECT * FROM schema2"), q.id == p.id)
+      |> join(:inner, [p], q in fragment("SELECT * FROM schema2"), on: q.id == p.id)
       |> select([p], {p.id, ^0})
       |> normalize
 
@@ -792,7 +814,7 @@ defmodule Sqlite.Ecto2.Test do
   describe "query interpolation parameters" do
     test "self join on subquery" do
       subquery = select(Schema, [r], %{x: r.x, y: r.y})
-      query = subquery |> join(:inner, [c], p in subquery(subquery), true) |> normalize
+      query = subquery |> join(:inner, [c], p in subquery(subquery), on: true) |> normalize
 
       assert all(query) ==
                ~s{SELECT s0."x", s0."y" FROM "schema" AS s0 INNER JOIN } <>
@@ -801,7 +823,7 @@ defmodule Sqlite.Ecto2.Test do
 
     test "self join on subquery with fragment" do
       subquery = select(Schema, [r], %{string: fragment("downcase(?)", ^"string")})
-      query = subquery |> join(:inner, [c], p in subquery(subquery), true) |> normalize
+      query = subquery |> join(:inner, [c], p in subquery(subquery), on: true) |> normalize
 
       assert all(query) ==
                ~s{SELECT downcase(?1) FROM "schema" AS s0 INNER JOIN } <>
@@ -814,7 +836,7 @@ defmodule Sqlite.Ecto2.Test do
       query =
         Schema
         |> select([r], %{y: ^666})
-        |> join(:inner, [c], p in subquery(subquery), true)
+        |> join(:inner, [c], p in subquery(subquery), on: true)
         |> where([a, b], a.x == ^111)
         |> normalize
 
@@ -902,13 +924,13 @@ defmodule Sqlite.Ecto2.Test do
 
     query = insert(nil, "schema", [:x, :y], [[:x, :y]], {update, [], [:x, :y]}, [:z])
 
-    assert query =
+    assert query ==
              ~s{INSERT INTO "schema" ("x","y") VALUES (?1,?2) ON CONFLICT ("x","y") DO UPDATE SET "z" = ?3 WHERE ("schema"."w" = 1) ;--RETURNING ON INSERT "schema","z"}
 
     update = normalize(from("schema", update: [set: [z: "foo"]]), :update_all)
     query = insert(nil, "schema", [:x, :y], [[:x, :y]], {update, [], [:x, :y]}, [:z])
 
-    assert query =
+    assert query ==
              ~s{INSERT INTO "schema" ("x","y") VALUES (?1,?2) ON CONFLICT ("x","y") DO UPDATE SET "z" = 'foo' ;--RETURNING ON INSERT "schema","z"}
 
     update =
@@ -916,7 +938,7 @@ defmodule Sqlite.Ecto2.Test do
 
     query = insert(nil, "schema", [:x, :y], [[:x, :y]], {update, [], [:x, :y]}, [:z])
 
-    assert query =
+    assert query ==
              ~s{INSERT INTO "schema" ("x","y") VALUES (?1,?2) ON CONFLICT ("x","y") DO UPDATE SET "z" = ?3 WHERE ("schema"."w" = 1) ;--RETURNING ON INSERT "schema","z"}
 
     # For :replace_all
@@ -1260,7 +1282,7 @@ defmodule Sqlite.Ecto2.Test do
        ]}
 
     assert execute_ddl(create) == [
-             ~s|CREATE TABLE "posts" ("a" TEXT DEFAULT '{"foo":"bar","baz":"boom"}')|
+             ~s|CREATE TABLE "posts" ("a" TEXT DEFAULT '{"baz":"boom","foo":"bar"}')|
            ]
   end
 

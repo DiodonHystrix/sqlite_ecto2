@@ -9,15 +9,17 @@ if Code.ensure_loaded?(Sqlitex.Server) do
 
     ## Module and Options
 
+    @impl true
     def child_spec(opts) do
       {:ok, _} = Application.ensure_all_started(:db_connection)
       DBConnection.child_spec(Sqlite.DbConnection.Protocol, opts)
     end
 
+    @impl true
     def to_constraints(_), do: []
 
     ## Query
-
+    @impl true
     def prepare_execute(conn, name, sql, params, opts) do
       query = %Sqlite.DbConnection.Query{name: name, statement: sql}
 
@@ -33,12 +35,25 @@ if Code.ensure_loaded?(Sqlitex.Server) do
       end
     end
 
+    @impl true
+    def query(conn, sql, params, opts) do
+      execute(conn, sql, params, opts)
+    end
+
+    @impl true
     def execute(conn, sql, params, opts) when is_binary(sql) or is_list(sql) do
       query = %Sqlite.DbConnection.Query{name: "", statement: IO.iodata_to_binary(sql)}
 
       case DBConnection.prepare_execute(conn, query, map_params(params), opts) do
+        # TODO: is this needed?
         {:ok, %Sqlite.DbConnection.Query{}, result} ->
           {:ok, result}
+
+        # {:ok, _, _} = ok ->
+        #   ok
+
+        # {:ok, result, %Sqlite.DbConnection.Protocol{}} ->
+        #   {:ok, result}
 
         {:error, %Sqlite.DbConnection.Error{}} = error ->
           error
@@ -50,8 +65,13 @@ if Code.ensure_loaded?(Sqlitex.Server) do
 
     def execute(conn, query, params, opts) do
       case DBConnection.execute(conn, query, map_params(params), opts) do
-        {:ok, _} = ok ->
-          ok
+        # {:ok, _} = ok ->
+        #   # TODO: i guess this can be removed
+        #   ok
+
+        {:ok, _query, result} ->
+          # TODO: it should just be ok welp
+          {:ok, result}
 
         {:error, %ArgumentError{} = err} ->
           {:reset, err}
@@ -64,21 +84,26 @@ if Code.ensure_loaded?(Sqlitex.Server) do
       end
     end
 
+    @impl true
     def stream(conn, sql, params, opts) do
       %Sqlite.DbConnection.Stream{conn: conn, query: sql, params: params, options: opts}
     end
 
     defp map_params(params) do
       Enum.map(params, fn
-        %{__struct__: _} = data_type ->
-          {:ok, value} = Ecto.DataType.dump(data_type)
+        %{__struct__: _} = value ->
+          # {:ok, value} = Ecto.DataType.dump(data_type)
           value
 
         %{} = value ->
-          Ecto.Adapter.json_library().encode!(value)
+          Application.get_env(:ecto, :json_library, Jason).encode!(value)
+
+        #          Ecto.Adapter.json_library().encode!(value)
 
         value when is_list(value) ->
-          Ecto.Adapter.json_library().encode!(value)
+          Application.get_env(:ecto, :json_library, Jason).encode!(value)
+
+        #         Ecto.Adapter.json_library().encode!(value)
 
         value ->
           value
@@ -90,6 +115,7 @@ if Code.ensure_loaded?(Sqlitex.Server) do
     alias Ecto.Query.JoinExpr
     alias Ecto.Query.QueryExpr
 
+    @impl true
     def all(%Ecto.Query{lock: lock}) when lock != nil do
       raise ArgumentError, "locks are not supported by SQLite"
     end
@@ -126,6 +152,7 @@ if Code.ensure_loaded?(Sqlitex.Server) do
       [prefix, fields, where | returning(query, sources, :update)]
     end
 
+    @impl true
     def delete_all(%Ecto.Query{joins: [_ | _]}) do
       raise ArgumentError, "JOINS are not supported on DELETE statements by SQLite"
     end
@@ -139,6 +166,7 @@ if Code.ensure_loaded?(Sqlitex.Server) do
       ["DELETE FROM ", from, where | returning(query, sources, :delete)]
     end
 
+    @impl true
     def insert(prefix, table, header, rows, on_conflict, returning) do
       values =
         if header == [] do
@@ -213,15 +241,41 @@ if Code.ensure_loaded?(Sqlitex.Server) do
       end)
     end
 
+    @impl true
     def update(prefix, table, fields, filters, returning) do
+      # {fields, count} =
+      #   intersperse_reduce(fields, ", ", 1, fn field, acc ->
+      #     {[quote_name(field), " = ?" | Integer.to_string(acc)], acc + 1}
+      #   end)
+
+      # {filters, _count} =
+      #   intersperse_reduce(filters, " AND ", count, fn field, acc ->
+      #     {[quote_name(field), " = ?" | Integer.to_string(acc)], acc + 1}
+      #   end)
+
+      # fields = intersperse_map(fields, ", ", &[quote_name(&1), " = ?"])
+
+      # filters =
+      #   intersperse_map(filters, " AND ", fn
+      #     {field, nil} ->
+      #       [quote_name(field), " IS NULL"]
+
+      #     {field, _value} ->
+      #       [quote_name(field), " = ?"]
+      #   end)
+
       {fields, count} =
         intersperse_reduce(fields, ", ", 1, fn field, acc ->
-          {[quote_name(field), " = ?" | Integer.to_string(acc)], acc + 1}
+          {[quote_name(field), " = $" | Integer.to_string(acc)], acc + 1}
         end)
 
       {filters, _count} =
-        intersperse_reduce(filters, " AND ", count, fn field, acc ->
-          {[quote_name(field), " = ?" | Integer.to_string(acc)], acc + 1}
+        intersperse_reduce(filters, " AND ", count, fn
+          {field, nil}, acc ->
+            {[quote_name(field), " IS NULL"], acc}
+
+          {field, _value}, acc ->
+            {[quote_name(field), " = $" | Integer.to_string(acc)], acc + 1}
         end)
 
       return = returning_clause(prefix, table, returning, "UPDATE")
@@ -229,10 +283,15 @@ if Code.ensure_loaded?(Sqlitex.Server) do
       ["UPDATE ", quote_table(prefix, table), " SET ", fields, " WHERE ", filters | return]
     end
 
+    @impl true
     def delete(prefix, table, filters, returning) do
       {filters, _} =
-        intersperse_reduce(filters, " AND ", 1, fn field, acc ->
-          {[quote_name(field), " = ?" | Integer.to_string(acc)], acc + 1}
+        intersperse_reduce(filters, " AND ", 1, fn
+          {field, nil}, acc ->
+            {[quote_name(field), " IS NULL"], acc}
+
+          {field, _value}, acc ->
+            {[quote_name(field), " = ?" | Integer.to_string(acc)], acc + 1}
         end)
 
       [
@@ -292,8 +351,8 @@ if Code.ensure_loaded?(Sqlitex.Server) do
       raise ArgumentError, "DISTINCT with multiple columns is not supported by SQLite"
     end
 
-    defp from(%{from: from} = query, sources) do
-      {from, name} = get_source(query, sources, 0, from)
+    defp from(%{from: %{source: source}} = query, sources) do
+      {from, name} = get_source(query, sources, 0, source)
       [" FROM ", from, " AS " | name]
     end
 
@@ -660,30 +719,30 @@ if Code.ensure_loaded?(Sqlitex.Server) do
     # datetime string. When we get here, we look for a CAST function as a signal
     # to convert that back to Elixir date types.
 
-    defp create_names(%{prefix: prefix, sources: sources}, stmt) do
-      create_names(prefix, sources, 0, tuple_size(sources), stmt)
+    defp create_names(%{sources: sources}, stmt) do
+      create_names(sources, 0, tuple_size(sources), stmt)
       |> prohibit_subquery_if_necessary(stmt)
       |> List.to_tuple()
     end
 
-    defp create_names(prefix, sources, pos, limit, stmt) when pos < limit do
+    defp create_names(sources, pos, limit, stmt) when pos < limit do
       current =
         case elem(sources, pos) do
-          {table, schema} ->
-            name = [String.first(table) | Integer.to_string(pos)]
-            {quote_table(prefix, table), name, schema}
-
           {:fragment, _, _} ->
             {nil, [?f | Integer.to_string(pos)], nil}
+
+          {table, schema, prefix} ->
+            name = [String.first(table) | Integer.to_string(pos)]
+            {quote_table(prefix, table), name, schema}
 
           %Ecto.SubQuery{} ->
             {nil, [?s | Integer.to_string(pos)], nil}
         end
 
-      [current | create_names(prefix, sources, pos + 1, limit, stmt)]
+      [current | create_names(sources, pos + 1, limit, stmt)]
     end
 
-    defp create_names(_prefix, _sources, pos, pos, _stmt) do
+    defp create_names(_sources, pos, pos, _stmt) do
       []
     end
 
@@ -823,6 +882,9 @@ if Code.ensure_loaded?(Sqlitex.Server) do
     def execute_ddl(keyword) when is_list(keyword),
       do: error!(nil, "SQLite adapter does not support keyword lists in execute")
 
+    @impl true
+    def ddl_logs(_), do: []
+
     defp column_definitions(table, columns) do
       intersperse_map(columns, ", ", &column_definition(table, &1))
     end
@@ -950,7 +1012,8 @@ if Code.ensure_loaded?(Sqlitex.Server) do
       do: [" DEFAULT ", to_string(literal)]
 
     defp default_expr({:ok, %{} = map}, :map) do
-      default = Ecto.Adapter.json_library().encode!(map)
+      default = Application.get_env(:ecto, :sqlite_ecto2, Jason).encode!(map)
+
       [" DEFAULT ", single_quote(default)]
     end
 

@@ -4,9 +4,14 @@ defmodule Sqlite.DbConnection.Protocol do
   alias Sqlite.DbConnection.Query
   use DBConnection
 
-  defstruct db: nil, path: nil, checked_out?: false
+  defstruct db: nil, path: nil, checked_out?: false, transaction_status: :idle
 
-  @type state :: %__MODULE__{db: pid, path: String.t(), checked_out?: boolean}
+  @type state :: %__MODULE__{
+          db: pid,
+          path: String.t(),
+          checked_out?: boolean,
+          transaction_status: DBConnection.status()
+        }
 
   @spec connect(Keyword.t()) :: {:ok, state}
   def connect(opts) do
@@ -17,7 +22,7 @@ defmodule Sqlite.DbConnection.Protocol do
     :ok = Sqlitex.Server.exec(db, "PRAGMA foreign_keys = ON")
     {:ok, [[foreign_keys: 1]]} = Sqlitex.Server.query(db, "PRAGMA foreign_keys")
 
-    {:ok, %__MODULE__{db: db, path: db_path, checked_out?: false}}
+    {:ok, %__MODULE__{db: db, path: db_path, checked_out?: false, transaction_status: :idle}}
   end
 
   @spec disconnect(Exception.t(), state) :: :ok
@@ -28,16 +33,52 @@ defmodule Sqlite.DbConnection.Protocol do
 
   def disconnect(_exception, _state), do: :ok
 
+  # @spec ping(state) ::
+  # {:ok, state}
+  # | {:disconnect, Postgrex.Error.t() | %DBConnection.ConnectionError{}, state}
+  # def ping(%{postgres: :transaction, transactions: :strict} = s) do
+  #   sync_error(s, :transaction)
+  # end
+
+  # def ping(%{buffer: buffer} = s) do
+  #   status = new_status([], mode: :transaction)
+  #   s = %{s | buffer: nil}
+
+  #   case msg_send(s, msg_sync(), buffer) do
+  #     :ok when buffer == :active_once ->
+  #       ping_recv(s, status, :active_once, buffer)
+
+  #     :ok when is_binary(buffer) ->
+  #       ping_recv(s, status, nil, buffer)
+
+  #     {:disconnect, _, _} = dis ->
+  #       dis
+  #   end
+  # end
+
+  @impl true
   @spec checkout(state) :: {:ok, state}
   def checkout(%{checked_out?: false} = s) do
     {:ok, %{s | checked_out?: true}}
   end
 
+  @impl true
   @spec checkin(state) :: {:ok, state}
   def checkin(%{checked_out?: true} = s) do
     {:ok, %{s | checked_out?: false}}
   end
 
+  # @impl true
+  # def checkout(state) do
+  #   {:ok, state}
+  # end
+
+  # @impl true
+  # def checkin(state) do
+  #   {:ok, state}
+  # end
+
+  @impl true
   @spec handle_prepare(Sqlite.DbConnection.Query.t(), Keyword.t(), state) ::
           {:ok, Sqlite.DbConnection.Query.t(), state}
           | {:error, ArgumentError.t(), state}
@@ -62,6 +103,7 @@ defmodule Sqlite.DbConnection.Protocol do
     query_error(s, "query #{inspect(query)} has already been prepared")
   end
 
+  @impl true
   @spec handle_execute(Sqlite.DbConnection.Query.t(), list, Keyword.t(), state) ::
           {:ok, Sqlite.DbConnection.Result.t(), state}
           | {:error, ArgumentError.t(), state}
@@ -70,6 +112,7 @@ defmodule Sqlite.DbConnection.Protocol do
     handle_execute(query, params, :sync, opts, s)
   end
 
+  @impl true
   @spec handle_close(Sqlite.DbConnection.Query.t(), Keyword.t(), state) ::
           {:ok, Sqlite.DbConnection.Result.t(), state}
           | {:error, ArgumentError.t(), state}
@@ -81,37 +124,93 @@ defmodule Sqlite.DbConnection.Protocol do
     {:ok, res, s}
   end
 
+  @impl true
+  def ping(state), do: {:ok, state}
+  #   case Client.com_ping(state) do
+  #     {:ok, ok_packet(status_flags: status_flags)} ->
+  #       {:ok, put_status(state, status_flags)}
+
+  #     {:error, reason} ->
+  #       {:disconnect, error(reason), state}
+  #   end
+  # end
+
+  @impl true
   @spec handle_begin(Keyword.t(), state) :: {:ok, Sqlite.DbConnection.Result.t(), state}
-  def handle_begin(opts, s) do
+  def handle_begin(opts, %{transaction_status: status} = s) do
     sql =
       case Keyword.get(opts, :mode, :transaction) do
         :transaction -> "BEGIN"
         :savepoint -> "SAVEPOINT sqlite_ecto_savepoint"
       end
 
-    handle_transaction(sql, [timeout: Keyword.get(opts, :timeout, 5000)], s)
+    handle_transaction(sql, [timeout: Keyword.get(opts, :timeout, 5000)], %{
+      s
+      | transaction_status: :transaction
+    })
+
+    # case Keyword.get(opts, :mode, :transaction) do
+    #   :transaction when status == :idle ->
+    #     handle_transaction("BEGIN", [timeout: Keyword.get(opts, :timeout, 5000)], %{
+    #       s
+    #       | transaction_status: :transaction
+    #     })
+
+    #   :savepoint when status == :transaction ->
+    #     handle_transaction(
+    #       "SAVEPOINT sqlite_ecto_savepoint",
+    #       [timeout: Keyword.get(opts, :timeout, 5000)],
+    #       %{s | transaction_status: :transaction}
+    #     )
+
+    #   mode when mode in [:transaction, :savepoint] ->
+    #     {status, s}
+    # end
   end
 
+  @impl true
   @spec handle_commit(Keyword.t(), state) :: {:ok, Sqlite.DbConnection.Result.t(), state}
-  def handle_commit(opts, s) do
-    sql =
-      case Keyword.get(opts, :mode, :transaction) do
-        :transaction -> "COMMIT"
-        :savepoint -> "RELEASE SAVEPOINT sqlite_ecto_savepoint"
-      end
+  def handle_commit(opts, %{transaction_status: status} = s) do
+    case Keyword.get(opts, :mode, :transaction) do
+      :transaction when status == :transaction ->
+        handle_transaction("COMMIT", [timeout: Keyword.get(opts, :timeout, 5000)], %{
+          s
+          | transaction_status: :idle
+        })
 
-    handle_transaction(sql, [timeout: Keyword.get(opts, :timeout, 5000)], s)
+      :savepoint when status == :transaction ->
+        handle_transaction(
+          "RELEASE SAVEPOINT sqlite_ecto_savepoint",
+          [timeout: Keyword.get(opts, :timeout, 5000)],
+          %{s | transaction_status: :idle}
+        )
+
+      mode when mode in [:transaction, :savepoint] ->
+        {status, s}
+    end
   end
 
+  @impl true
   @spec handle_rollback(Keyword.t(), state) :: {:ok, Sqlite.DbConnection.Result.t(), state}
-  def handle_rollback(opts, s) do
+  def handle_rollback(opts, %{transaction_status: status} = s) do
     sql =
       case Keyword.get(opts, :mode, :transaction) do
-        :transaction -> "ROLLBACK"
-        :savepoint -> "ROLLBACK TO SAVEPOINT sqlite_ecto_savepoint"
+        :transaction ->
+          "ROLLBACK"
+
+        :savepoint ->
+          "ROLLBACK TO SAVEPOINT sqlite_ecto_savepoint"
       end
 
-    handle_transaction(sql, [timeout: Keyword.get(opts, :timeout, 5000)], s)
+    handle_transaction(sql, [timeout: Keyword.get(opts, :timeout, 5000)], %{
+      s
+      | transaction_status: :idle
+    })
+  end
+
+  @impl true
+  def handle_status(_, %{transaction_status: status} = state) do
+    {status, state}
   end
 
   defp refined_info(prepared_info) do
@@ -135,12 +234,12 @@ defmodule Sqlite.DbConnection.Protocol do
   defp maybe_atom_to_lc_string(nil), do: nil
   defp maybe_atom_to_lc_string(item), do: item |> to_string |> String.downcase()
 
-  defp handle_execute(%Query{statement: sql}, params, _sync, opts, s) do
+  defp handle_execute(%Query{statement: sql} = query, params, _sync, opts, s) do
     # Note that we rely on Sqlitex.Server to cache the prepared statement,
     # so we can simply refer to the original SQL statement here.
     case run_stmt(sql, params, opts, s) do
       {:ok, result} ->
-        {:ok, result, s}
+        {:ok, query, result, s}
 
       other ->
         other

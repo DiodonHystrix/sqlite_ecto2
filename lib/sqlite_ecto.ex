@@ -36,17 +36,17 @@ defmodule Sqlite.Ecto2 do
   # Inherit all behaviour from Ecto.Adapters.SQL
   use Ecto.Adapters.SQL, :sqlitex
 
-  import String, only: [to_integer: 1]
-
   # And provide a custom storage implementation
   @behaviour Ecto.Adapter.Storage
 
   ## Custom SQLite Types
 
+  @impl true
   def loaders(:boolean, type), do: [&bool_decode/1, type]
   def loaders(:binary_id, type), do: [Ecto.UUID, type]
-  def loaders(:utc_datetime, type), do: [&date_decode/1, type]
-  def loaders(:naive_datetime, type), do: [&date_decode/1, type]
+  def loaders(:date, type), do: [&date_decode/1, type]
+  def loaders(:utc_datetime, type), do: [&datetime_decode/1, type]
+  def loaders(:naive_datetime, type), do: [&naive_datetime_decode/1, type]
 
   def loaders({:embed, _} = type, _),
     do: [&json_decode/1, &Ecto.Adapters.SQL.load_embed(type, &1)]
@@ -61,24 +61,24 @@ defmodule Sqlite.Ecto2 do
   defp bool_decode(1), do: {:ok, true}
   defp bool_decode(x), do: {:ok, x}
 
-  defp date_decode(<<year::binary-size(4), "-", month::binary-size(2), "-", day::binary-size(2)>>) do
-    {:ok, {to_integer(year), to_integer(month), to_integer(day)}}
+  defp date_decode(tuple), do: Date.from_erl(tuple)
+
+  defp datetime_decode(datetime) do
+    {:ok, naive_datetime} = naive_datetime_decode(datetime)
+    DateTime.from_naive(naive_datetime, "Etc/UTC")
   end
 
-  defp date_decode(
-         <<year::binary-size(4), "-", month::binary-size(2), "-", day::binary-size(2), " ",
-           hour::binary-size(2), ":", minute::binary-size(2), ":", second::binary-size(2), ".",
-           microsecond::binary-size(6)>>
-       ) do
-    {:ok,
-     {{to_integer(year), to_integer(month), to_integer(day)},
-      {to_integer(hour), to_integer(minute), to_integer(second), to_integer(microsecond)}}}
-  end
+  # defp datetime_decode({y, m, d}), do: Date.new(y, m, d)
 
-  defp date_decode(x), do: {:ok, x}
+  defp naive_datetime_decode(binary) when is_binary(binary),
+    do: NaiveDateTime.from_iso8601(binary)
+
+  defp naive_datetime_decode({{y, m, d}, {min, sec, microsecond, _}}),
+    do: NaiveDateTime.new(y, m, d, min, sec, microsecond)
 
   defp json_decode(x) when is_binary(x),
-    do: {:ok, Application.get_env(:ecto, :json_library).decode!(x)}
+    # TODO: change this
+    do: {:ok, Application.get_env(:ecto, :json_library, Jason).decode!(x)}
 
   defp json_decode(x),
     do: {:ok, x}
@@ -104,6 +104,7 @@ defmodule Sqlite.Ecto2 do
 
   ## Storage API
 
+  @impl true
   @doc false
   def storage_up(opts) do
     storage_up_with_path(Keyword.get(opts, :database), opts)
@@ -139,6 +140,7 @@ defmodule Sqlite.Ecto2 do
     end
   end
 
+  @impl true
   @doc false
   def storage_down(opts) do
     database = Keyword.get(opts, :database)
@@ -157,4 +159,41 @@ defmodule Sqlite.Ecto2 do
 
   @doc false
   def supports_ddl_transaction?, do: true
+
+  # Since SQLite doesn't have locks, we use this version of lock_for_migrations
+  # to disable the lock behavior and fall back to single-threaded migration.
+  # See https://github.com/elixir-ecto/ecto/pull/2215#issuecomment-332497229.
+  def lock_for_migrations(meta, query, _opts, callback) do
+    %{opts: default_opts} = meta
+
+    if Keyword.fetch(default_opts, :pool_size) == {:ok, 1} do
+      raise_pool_size_error()
+    end
+
+    query
+    |> Map.put(:lock, nil)
+    |> callback.()
+  end
+
+  defp raise_pool_size_error do
+    raise Ecto.MigrationError, """
+    Migrations failed to run because the connection pool size is less than 2.
+
+    Ecto requires a pool size of at least 2 to support concurrent migrators.
+    When migrations run, Ecto uses one connection to maintain a lock and
+    another to run migrations.
+
+    If you are running migrations with Mix, you can increase the number
+    of connections via the pool size option:
+
+        mix ecto.migrate --pool-size 2
+
+    If you are running the Ecto.Migrator programmatically, you can configure
+    the pool size via your application config:
+
+        config :my_app, Repo,
+          ...,
+          pool_size: 2 # at least
+    """
+  end
 end
